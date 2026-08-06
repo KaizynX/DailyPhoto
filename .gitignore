@@ -1,0 +1,32 @@
+# Local build output and bundled dependencies.
+.build/
+.build-packages/
+app/
+*.spec
+
+# Private photos and local backups.
+photos/
+
+# Python caches and test/tooling output.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and secrets.
+config.local.json
+.env
+.env.*
+!.env.example
+
+# Logs and OS/editor metadata.
+*.log
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+
+# Workspace-only metadata.
+.codex/
+.agents/

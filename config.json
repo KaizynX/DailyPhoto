@@ -1,0 +1,7 @@
+{
+  "capture_delay_seconds": 10,
+  "confirmation_timeout_seconds": 15,
+  "camera_index": 0,
+  "mirror_image": true,
+  "jpeg_quality": 95
+}
