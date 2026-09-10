@@ -1,4 +1,5 @@
 {
+  "photos_directory": "photos",
   "capture_delay_seconds": 10,
   "confirmation_timeout_seconds": 15,
   "camera_index": 0,

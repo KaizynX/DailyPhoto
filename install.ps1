@@ -7,46 +7,12 @@ if (-not (Test-Path -LiteralPath $executable)) {
     throw "$executable was not found. Run build.ps1 first."
 }
 
-$service = New-Object -ComObject "Schedule.Service"
-$service.Connect()
-$folder = $service.GetFolder("\")
-$task = $service.NewTask(0)
+$runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+$command = '"{0}" --startup' -f $executable
+New-Item -Path $runKey -Force | Out-Null
+New-ItemProperty -Path $runKey -Name "DailyPhoto" -PropertyType String -Value $command -Force | Out-Null
 
-$task.RegistrationInfo.Description = "Capture one daily desk photo after logon or unlock"
-$task.Settings.Enabled = $true
-$task.Settings.StartWhenAvailable = $true
-$task.Settings.DisallowStartIfOnBatteries = $false
-$task.Settings.StopIfGoingOnBatteries = $false
-$task.Settings.AllowHardTerminate = $true
-$task.Settings.ExecutionTimeLimit = "PT10M"
-$task.Settings.MultipleInstances = 2
+# Remove the scheduled-task registration used by older DailyPhoto versions.
+Unregister-ScheduledTask -TaskName "DailyPhoto" -Confirm:$false -ErrorAction SilentlyContinue
 
-$userId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-
-$logonTrigger = $task.Triggers.Create(9)
-$logonTrigger.Id = "Logon"
-$logonTrigger.UserId = $userId
-$logonTrigger.Enabled = $true
-
-$unlockTrigger = $task.Triggers.Create(11)
-$unlockTrigger.Id = "SessionUnlock"
-$unlockTrigger.UserId = $userId
-$unlockTrigger.StateChange = 8
-$unlockTrigger.Enabled = $true
-
-$action = $task.Actions.Create(0)
-$action.Path = $executable
-$action.WorkingDirectory = $root
-
-# TASK_CREATE_OR_UPDATE = 6; TASK_LOGON_INTERACTIVE_TOKEN = 3
-$null = $folder.RegisterTaskDefinition(
-    "DailyPhoto",
-    $task,
-    6,
-    $null,
-    $null,
-    3,
-    $null
-)
-
-Write-Host "Registered DailyPhoto for logon and session unlock."
+Write-Host "DailyPhoto will now start when you sign in."

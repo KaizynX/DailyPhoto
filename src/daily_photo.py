@@ -3,20 +3,28 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
+import queue
+import subprocess
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import filedialog, messagebox, ttk
+import winreg
 
 import cv2
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
+import pystray
 
 
 APP_NAME = "DailyPhoto"
 MUTEX_NAME = "Local\\DailyPhotoCaptureMutex"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+LEGACY_TASK_NAME = "DailyPhoto"
 MAX_PREVIEW_WIDTH = 800
 MAX_PREVIEW_HEIGHT = 450
 PREVIEW_ASPECT_RATIO = MAX_PREVIEW_WIDTH / MAX_PREVIEW_HEIGHT
@@ -25,12 +33,7 @@ WINDOW_VERTICAL_RESERVE = 170
 
 
 class Rect(ctypes.Structure):
-    _fields_ = [
-        ("left", ctypes.c_long),
-        ("top", ctypes.c_long),
-        ("right", ctypes.c_long),
-        ("bottom", ctypes.c_long),
-    ]
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
 
 class Point(ctypes.Structure):
@@ -38,12 +41,7 @@ class Point(ctypes.Structure):
 
 
 class MonitorInfo(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", ctypes.c_uint),
-        ("rcMonitor", Rect),
-        ("rcWork", Rect),
-        ("dwFlags", ctypes.c_uint),
-    ]
+    _fields_ = [("cbSize", ctypes.c_uint), ("rcMonitor", Rect), ("rcWork", Rect), ("dwFlags", ctypes.c_uint)]
 
 
 MONITOR_DEFAULTTONEAREST = 2
@@ -57,28 +55,51 @@ def app_root() -> Path:
 
 ROOT = app_root()
 CONFIG_PATH = ROOT / "config.json"
-PHOTOS_ROOT = ROOT / "photos"
+LOG_PATH = ROOT / "daily_photo.log"
 
 
-def load_config() -> dict:
-    defaults = {
+def setup_logging() -> None:
+    handler = RotatingFileHandler(LOG_PATH, maxBytes=512_000, backupCount=1, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+
+
+def default_config() -> dict:
+    return {
+        "photos_directory": "photos",
         "capture_delay_seconds": 10,
         "confirmation_timeout_seconds": 15,
         "camera_index": 0,
         "mirror_image": True,
         "jpeg_quality": 95,
     }
+
+
+def load_config() -> dict:
+    config = default_config()
     try:
         loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        defaults.update(loaded)
+        if isinstance(loaded, dict):
+            config.update(loaded)
     except (OSError, ValueError):
         pass
-    return defaults
+    return config
 
 
-def today_has_photo(now: datetime | None = None) -> bool:
+def save_config(config: dict) -> None:
+    temporary = CONFIG_PATH.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, CONFIG_PATH)
+
+
+def photos_root(config: dict) -> Path:
+    configured = Path(str(config.get("photos_directory", "photos"))).expanduser()
+    return configured if configured.is_absolute() else ROOT / configured
+
+
+def today_has_photo(config: dict, now: datetime | None = None) -> bool:
     now = now or datetime.now()
-    folder = PHOTOS_ROOT / now.strftime("%Y") / now.strftime("%m")
+    folder = photos_root(config) / now.strftime("%Y") / now.strftime("%m")
     return any(folder.glob(f"{now:%Y-%m-%d}_*.jpg")) if folder.exists() else False
 
 
@@ -92,68 +113,93 @@ def acquire_single_instance() -> object | None:
     return handle
 
 
-class DailyPhotoApp:
-    def __init__(self, config: dict) -> None:
-        self.config = config
-        self.root = tk.Tk()
-        # Do not let Windows map the window at Tk's default top-left position.
-        self.root.withdraw()
-        self.root.title("DailyPhoto · 今日照片")
-        self.root.configure(bg="#17191f")
-        self.root.resizable(False, False)
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+def startup_command() -> str:
+    if getattr(sys, "frozen", False):
+        parts = [str(Path(sys.executable).resolve()), "--startup"]
+    else:
+        parts = [str(Path(sys.executable).resolve()), str(Path(__file__).resolve()), "--startup"]
+    return subprocess.list2cmdline(parts)
+
+
+def legacy_task_exists() -> bool:
+    result = subprocess.run(
+        ["schtasks.exe", "/Query", "/TN", LEGACY_TASK_NAME],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def remove_legacy_task() -> None:
+    subprocess.run(
+        ["schtasks.exe", "/Delete", "/TN", LEGACY_TASK_NAME, "/F"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        check=False,
+    )
+
+
+def is_autostart_enabled() -> bool:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            winreg.QueryValueEx(key, APP_NAME)
+        return True
+    except OSError:
+        return legacy_task_exists()
+
+
+def set_autostart(enabled: bool) -> None:
+    if enabled:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, startup_command())
+        remove_legacy_task()
+        return
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, APP_NAME)
+    except FileNotFoundError:
+        pass
+    remove_legacy_task()
+
+
+def create_app_icon(size: int = 64) -> Image.Image:
+    image = Image.new("RGBA", (size, size), (25, 28, 35, 255))
+    draw = ImageDraw.Draw(image)
+    scale = size / 64
+    scaled = lambda box: tuple(int(value * scale) for value in box)
+    draw.rounded_rectangle(scaled((8, 18, 56, 51)), radius=max(2, int(7 * scale)), fill=(47, 125, 255, 255))
+    draw.rounded_rectangle(scaled((17, 12, 33, 21)), radius=max(1, int(3 * scale)), fill=(47, 125, 255, 255))
+    draw.ellipse(scaled((22, 24, 46, 48)), fill=(245, 245, 247, 255))
+    draw.ellipse(scaled((27, 29, 41, 43)), fill=(25, 28, 35, 255))
+    return image
+
+
+class CaptureWindow:
+    def __init__(self, app: "DailyPhotoApp") -> None:
+        self.app = app
+        self.config = app.config
+        self.window = tk.Toplevel(app.root)
+        self.window.withdraw()
+        self.window.title("DailyPhoto · 今日照片")
+        self.window.configure(bg="#17191f")
+        self.window.resizable(False, False)
+        self.window.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.window.iconphoto(True, app.tk_icon)
 
         _, _, available_width, available_height = self.get_work_area()
-        self.preview_width, self.preview_height = self.preview_size(
-            available_width, available_height
-        )
-
-        # Canvas dimensions are always pixels. A Label without an image treats
-        # width/height as text units, which made the initial window enormous.
-        self.preview = tk.Canvas(
-            self.root,
-            bg="#090a0d",
-            width=self.preview_width,
-            height=self.preview_height,
-            bd=0,
-            highlightthickness=0,
-        )
+        self.preview_width, self.preview_height = self.preview_size(available_width, available_height)
+        self.preview = tk.Canvas(self.window, bg="#090a0d", width=self.preview_width, height=self.preview_height, bd=0, highlightthickness=0)
         self.preview.pack(padx=16, pady=(16, 8))
-        self.preview_image = self.preview.create_image(
-            self.preview_width // 2, self.preview_height // 2
-        )
-
-        self.status = tk.Label(
-            self.root,
-            text="正在打开摄像头…",
-            fg="#f5f5f7",
-            bg="#17191f",
-            font=("Microsoft YaHei UI", 14),
-        )
+        self.preview_image = self.preview.create_image(self.preview_width // 2, self.preview_height // 2)
+        self.status = tk.Label(self.window, text="正在打开摄像头…", fg="#f5f5f7", bg="#17191f", font=("Microsoft YaHei UI", 14))
         self.status.pack(pady=(4, 8))
-
-        self.buttons = tk.Frame(self.root, bg="#17191f")
+        self.buttons = tk.Frame(self.window, bg="#17191f")
         self.buttons.pack(pady=(0, 16))
-
-        self.save_button = tk.Button(
-            self.buttons,
-            text="保存",
-            width=12,
-            font=("Microsoft YaHei UI", 11),
-            bg="#2f7dff",
-            fg="white",
-            activebackground="#2466d4",
-            relief="flat",
-            command=self.save,
-        )
-        self.retake_button = tk.Button(
-            self.buttons,
-            text="重拍",
-            width=12,
-            font=("Microsoft YaHei UI", 11),
-            relief="flat",
-            command=self.start_countdown,
-        )
+        self.save_button = tk.Button(self.buttons, text="保存", width=12, font=("Microsoft YaHei UI", 11), bg="#2f7dff", fg="white", activebackground="#2466d4", relief="flat", command=self.save)
+        self.retake_button = tk.Button(self.buttons, text="重拍", width=12, font=("Microsoft YaHei UI", 11), relief="flat", command=self.start_countdown)
 
         self.capture = None
         self.current_frame = None
@@ -162,81 +208,60 @@ class DailyPhotoApp:
         self.countdown_started = 0.0
         self.confirm_started = 0.0
         self.mode = "opening"
-        self.root.after(100, self.open_camera)
+        self.window.after(100, self.open_camera)
         self.center_window()
 
     def get_work_area(self) -> tuple[int, int, int, int]:
-        """Return the work area of the monitor containing the mouse pointer."""
         try:
             user32 = ctypes.windll.user32
-            pointer = Point(self.root.winfo_pointerx(), self.root.winfo_pointery())
+            pointer = Point(self.window.winfo_pointerx(), self.window.winfo_pointery())
             monitor = user32.MonitorFromPoint(pointer, MONITOR_DEFAULTTONEAREST)
             info = MonitorInfo()
             info.cbSize = ctypes.sizeof(MonitorInfo)
             if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
                 work = info.rcWork
-                return (
-                    work.left,
-                    work.top,
-                    work.right - work.left,
-                    work.bottom - work.top,
-                )
+                return work.left, work.top, work.right - work.left, work.bottom - work.top
         except (AttributeError, OSError, tk.TclError):
             pass
-
-        return 0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        return 0, 0, self.window.winfo_screenwidth(), self.window.winfo_screenheight()
 
     @staticmethod
     def preview_size(available_width: int, available_height: int) -> tuple[int, int]:
-        """Fit a 16:9 preview inside the current monitor's usable work area."""
-        max_width = min(
-            MAX_PREVIEW_WIDTH,
-            max(1, available_width - WINDOW_HORIZONTAL_RESERVE),
-        )
-        max_height = min(
-            MAX_PREVIEW_HEIGHT,
-            max(1, available_height - WINDOW_VERTICAL_RESERVE),
-        )
+        max_width = min(MAX_PREVIEW_WIDTH, max(1, available_width - WINDOW_HORIZONTAL_RESERVE))
+        max_height = min(MAX_PREVIEW_HEIGHT, max(1, available_height - WINDOW_VERTICAL_RESERVE))
         width = min(max_width, int(max_height * PREVIEW_ASPECT_RATIO))
         height = max(1, int(width / PREVIEW_ASPECT_RATIO))
         return max(1, width), height
 
     def center_window(self) -> None:
-        self.root.update_idletasks()
-        width = self.root.winfo_reqwidth()
-        height = self.root.winfo_reqheight()
-
+        self.window.update_idletasks()
+        width, height = self.window.winfo_reqwidth(), self.window.winfo_reqheight()
         left, top, available_width, available_height = self.get_work_area()
-
         x = left + max(0, (available_width - width) // 2)
         y = top + max(0, (available_height - height) // 2)
         position = f"+{x}+{y}"
-        self.root.geometry(position)
-        self.root.deiconify()
-        self.root.lift()
-        # Reapply after the first map because some Windows/Tk combinations
-        # replace a pre-mainloop position with the default top-left placement.
-        self.root.after_idle(lambda: self.root.geometry(position))
-        self.root.attributes("-topmost", True)
-        self.root.after(1500, lambda: self.root.attributes("-topmost", False))
+        self.window.geometry(position)
+        self.window.deiconify()
+        self.window.lift()
+        self.window.after_idle(lambda: self.window.geometry(position))
+        self.window.attributes("-topmost", True)
+        self.window.after(1500, lambda: self.window.attributes("-topmost", False))
 
     def open_camera(self) -> None:
         index = int(self.config["camera_index"])
+        logging.info("Opening camera index %s", index)
         self.capture = cv2.VideoCapture(index, cv2.CAP_DSHOW)
         if not self.capture.isOpened():
+            logging.error("Unable to open camera index %s", index)
             self.capture.release()
             self.capture = cv2.VideoCapture(index)
         if not self.capture.isOpened():
-            messagebox.showerror(
-                APP_NAME,
-                "无法打开摄像头。请确认摄像头未被其他程序独占，"
-                "并检查 Windows 的摄像头隐私权限。",
-            )
-            self.root.destroy()
+            messagebox.showerror(APP_NAME, "无法打开摄像头。请确认摄像头未被其他程序独占，并检查 Windows 的摄像头隐私权限。", parent=self.window)
+            self.close()
             return
-
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        logging.info("Camera opened")
         self.start_countdown()
         self.update_video()
 
@@ -249,20 +274,16 @@ class DailyPhotoApp:
         self.status.configure(text="准备拍摄…")
 
     def update_video(self) -> None:
-        if self.capture is None or not self.capture.isOpened():
+        if self.capture is None or not self.capture.isOpened() or not self.window.winfo_exists():
             return
-
         ok, frame = self.capture.read()
         if ok:
             if bool(self.config["mirror_image"]):
                 frame = cv2.flip(frame, 1)
             self.current_frame = frame
-
         if self.mode == "countdown":
             elapsed = time.monotonic() - self.countdown_started
-            remaining = max(
-                0, int(float(self.config["capture_delay_seconds"]) - elapsed + 0.999)
-            )
+            remaining = max(0, int(float(self.config["capture_delay_seconds"]) - elapsed + 0.999))
             self.status.configure(text=f"{remaining} 秒后拍摄")
             if elapsed >= float(self.config["capture_delay_seconds"]):
                 self.take_photo()
@@ -270,20 +291,11 @@ class DailyPhotoApp:
                 self.show_frame(self.current_frame)
         elif self.mode == "confirm":
             elapsed = time.monotonic() - self.confirm_started
-            remaining = max(
-                0,
-                int(
-                    float(self.config["confirmation_timeout_seconds"])
-                    - elapsed
-                    + 0.999
-                ),
-            )
+            remaining = max(0, int(float(self.config["confirmation_timeout_seconds"]) - elapsed + 0.999))
             self.status.configure(text=f"查看照片 · {remaining} 秒后自动保存")
             if elapsed >= float(self.config["confirmation_timeout_seconds"]):
                 self.save()
-
-        if self.root.winfo_exists():
-            self.root.after(33, self.update_video)
+        self.window.after(33, self.update_video)
 
     def take_photo(self) -> None:
         if self.current_frame is None:
@@ -291,6 +303,7 @@ class DailyPhotoApp:
             self.countdown_started = time.monotonic()
             return
         self.frozen_frame = self.current_frame.copy()
+        logging.info("Photo frame captured")
         self.mode = "confirm"
         self.confirm_started = time.monotonic()
         self.show_frame(self.frozen_frame)
@@ -300,19 +313,9 @@ class DailyPhotoApp:
     def show_frame(self, frame) -> None:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb)
-        image.thumbnail(
-            (self.preview_width, self.preview_height), Image.Resampling.LANCZOS
-        )
-        canvas = Image.new(
-            "RGB", (self.preview_width, self.preview_height), "#090a0d"
-        )
-        canvas.paste(
-            image,
-            (
-                (self.preview_width - image.width) // 2,
-                (self.preview_height - image.height) // 2,
-            ),
-        )
+        image.thumbnail((self.preview_width, self.preview_height), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", (self.preview_width, self.preview_height), "#090a0d")
+        canvas.paste(image, ((self.preview_width - image.width) // 2, (self.preview_height - image.height) // 2))
         self.tk_image = ImageTk.PhotoImage(canvas)
         self.preview.itemconfigure(self.preview_image, image=self.tk_image)
 
@@ -321,57 +324,239 @@ class DailyPhotoApp:
             return
         self.mode = "saving"
         now = datetime.now()
-        folder = PHOTOS_ROOT / now.strftime("%Y") / now.strftime("%m")
-        folder.mkdir(parents=True, exist_ok=True)
+        folder = photos_root(self.config) / now.strftime("%Y") / now.strftime("%m")
         destination = folder / f"{now:%Y-%m-%d_%H-%M-%S}.jpg"
         temporary = destination.with_suffix(".jpg.tmp")
-
         quality = max(1, min(100, int(self.config["jpeg_quality"])))
-        ok, encoded = cv2.imencode(
-            ".jpg", self.frozen_frame, [cv2.IMWRITE_JPEG_QUALITY, quality]
-        )
+        ok, encoded = cv2.imencode(".jpg", self.frozen_frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
         try:
             if not ok:
                 raise OSError("JPEG 编码失败")
+            folder.mkdir(parents=True, exist_ok=True)
             temporary.write_bytes(encoded.tobytes())
             os.replace(temporary, destination)
         except OSError as exc:
             self.mode = "confirm"
-            messagebox.showerror(APP_NAME, f"保存照片失败：\n{exc}")
+            messagebox.showerror(APP_NAME, f"保存照片失败：\n{exc}", parent=self.window)
             return
-
         self.status.configure(text=f"已保存：{destination.name}")
-        self.root.after(900, self.root.destroy)
+        logging.info("Photo saved to %s", destination)
+        self.window.after(900, self.close)
 
     def on_close(self) -> None:
         if self.mode == "confirm" and self.frozen_frame is not None:
             self.save()
         else:
-            self.root.destroy()
+            self.close()
+
+    def close(self) -> None:
+        if self.capture is not None:
+            self.capture.release()
+            self.capture = None
+        if self.window.winfo_exists():
+            self.window.destroy()
+        self.app.capture_window = None
+
+
+class DailyPhotoApp:
+    def __init__(self, config: dict, force_capture: bool) -> None:
+        self.config = config
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.title(APP_NAME)
+        self.root.protocol("WM_DELETE_WINDOW", self.exit)
+        self.icon_image = create_app_icon()
+        self.tk_icon = ImageTk.PhotoImage(self.icon_image)
+        self.root.iconphoto(True, self.tk_icon)
+        self.capture_window: CaptureWindow | None = None
+        self.settings_window: tk.Toplevel | None = None
+        self.actions: queue.Queue[str] = queue.Queue()
+        self.tray = pystray.Icon(
+            APP_NAME,
+            self.icon_image,
+            "DailyPhoto · 每日照片",
+            menu=pystray.Menu(
+                pystray.MenuItem("立即拍照", self.enqueue_capture, default=True),
+                pystray.MenuItem("参数设置…", self.enqueue_settings),
+                pystray.MenuItem("打开照片目录", self.enqueue_open_folder),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("开机自启动", self.enqueue_toggle_autostart, checked=lambda item: is_autostart_enabled()),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("退出", self.enqueue_exit),
+            ),
+        )
+        self.tray.run_detached()
+        self.root.after(100, self.process_actions)
+        if force_capture or not today_has_photo(self.config):
+            self.root.after(250, self.open_capture)
+
+    def enqueue_capture(self, icon=None, item=None) -> None:
+        self.actions.put("capture")
+
+    def enqueue_settings(self, icon=None, item=None) -> None:
+        self.actions.put("settings")
+
+    def enqueue_open_folder(self, icon=None, item=None) -> None:
+        self.actions.put("folder")
+
+    def enqueue_toggle_autostart(self, icon=None, item=None) -> None:
+        self.actions.put("autostart")
+
+    def enqueue_exit(self, icon=None, item=None) -> None:
+        self.actions.put("exit")
+
+    def process_actions(self) -> None:
+        try:
+            while True:
+                action = self.actions.get_nowait()
+                if action == "capture":
+                    self.open_capture()
+                elif action == "settings":
+                    self.open_settings()
+                elif action == "folder":
+                    self.open_photos_folder()
+                elif action == "autostart":
+                    self.toggle_autostart()
+                elif action == "exit":
+                    self.exit()
+                    return
+        except queue.Empty:
+            pass
+        self.root.after(100, self.process_actions)
+
+    def open_capture(self) -> None:
+        logging.info("Opening capture window")
+        if self.capture_window is not None:
+            self.capture_window.window.deiconify()
+            self.capture_window.window.lift()
+            return
+        self.capture_window = CaptureWindow(self)
+
+    def open_settings(self) -> None:
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self.settings_window.deiconify()
+            self.settings_window.lift()
+            return
+        window = tk.Toplevel(self.root)
+        self.settings_window = window
+        window.title("DailyPhoto · 参数设置")
+        window.resizable(False, False)
+        window.iconphoto(True, self.tk_icon)
+        window.protocol("WM_DELETE_WINDOW", self.close_settings)
+        frame = ttk.Frame(window, padding=18)
+        frame.grid(sticky="nsew")
+        values = {
+            "photos_directory": tk.StringVar(value=str(self.config["photos_directory"])),
+            "capture_delay_seconds": tk.StringVar(value=str(self.config["capture_delay_seconds"])),
+            "confirmation_timeout_seconds": tk.StringVar(value=str(self.config["confirmation_timeout_seconds"])),
+            "camera_index": tk.StringVar(value=str(self.config["camera_index"])),
+            "jpeg_quality": tk.StringVar(value=str(self.config["jpeg_quality"])),
+            "mirror_image": tk.BooleanVar(value=bool(self.config["mirror_image"])),
+        }
+        ttk.Label(frame, text="照片保存目录").grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Entry(frame, textvariable=values["photos_directory"], width=42).grid(row=0, column=1, padx=(12, 6), pady=5)
+
+        def choose_folder() -> None:
+            initial = photos_root({"photos_directory": values["photos_directory"].get()})
+            selected = filedialog.askdirectory(parent=window, initialdir=initial)
+            if selected:
+                values["photos_directory"].set(selected)
+
+        ttk.Button(frame, text="浏览…", command=choose_folder).grid(row=0, column=2, pady=5)
+        fields = [("拍照倒计时（秒）", "capture_delay_seconds"), ("自动保存等待（秒）", "confirmation_timeout_seconds"), ("摄像头编号", "camera_index"), ("JPEG 质量（1–100）", "jpeg_quality")]
+        for row, (label, key) in enumerate(fields, start=1):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=5)
+            ttk.Entry(frame, textvariable=values[key], width=12).grid(row=row, column=1, sticky="w", padx=12, pady=5)
+        ttk.Checkbutton(frame, text="镜像预览和照片", variable=values["mirror_image"]).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 12))
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=6, column=0, columnspan=3, sticky="e")
+        ttk.Button(buttons, text="取消", command=self.close_settings).pack(side="right", padx=(8, 0))
+
+        def apply_settings() -> None:
+            try:
+                directory = values["photos_directory"].get().strip()
+                if not directory:
+                    raise ValueError("照片保存目录不能为空")
+                delay = float(values["capture_delay_seconds"].get())
+                timeout = float(values["confirmation_timeout_seconds"].get())
+                camera = int(values["camera_index"].get())
+                quality = int(values["jpeg_quality"].get())
+                if not 0 <= delay <= 3600:
+                    raise ValueError("拍照倒计时必须在 0–3600 秒之间")
+                if not 0 <= timeout <= 3600:
+                    raise ValueError("自动保存等待必须在 0–3600 秒之间")
+                if camera < 0:
+                    raise ValueError("摄像头编号不能小于 0")
+                if not 1 <= quality <= 100:
+                    raise ValueError("JPEG 质量必须在 1–100 之间")
+                updated = dict(self.config)
+                updated.update(photos_directory=directory, capture_delay_seconds=delay, confirmation_timeout_seconds=timeout, camera_index=camera, jpeg_quality=quality, mirror_image=values["mirror_image"].get())
+                save_config(updated)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror(APP_NAME, f"无法保存设置：\n{exc}", parent=window)
+                return
+            self.config.clear()
+            self.config.update(updated)
+            self.close_settings()
+
+        ttk.Button(buttons, text="保存", command=apply_settings).pack(side="right")
+        window.update_idletasks()
+        x = max(0, (window.winfo_screenwidth() - window.winfo_reqwidth()) // 2)
+        y = max(0, (window.winfo_screenheight() - window.winfo_reqheight()) // 2)
+        window.geometry(f"+{x}+{y}")
+        window.lift()
+
+    def close_settings(self) -> None:
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self.settings_window.destroy()
+        self.settings_window = None
+
+    def open_photos_folder(self) -> None:
+        folder = photos_root(self.config)
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            os.startfile(folder)
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"无法打开照片目录：\n{exc}")
+
+    def toggle_autostart(self) -> None:
+        try:
+            set_autostart(not is_autostart_enabled())
+            self.tray.update_menu()
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"无法修改开机自启动设置：\n{exc}")
+
+    def exit(self) -> None:
+        if self.capture_window is not None:
+            self.capture_window.close()
+        self.close_settings()
+        self.tray.stop()
+        self.root.destroy()
 
     def run(self) -> None:
-        try:
-            self.root.mainloop()
-        finally:
-            if self.capture is not None:
-                self.capture.release()
+        self.root.mainloop()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--force", action="store_true", help="即使今天已有照片也打开拍摄窗口"
-    )
+    parser.add_argument("--force", action="store_true", help="立即打开拍摄窗口")
+    parser.add_argument("--startup", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-
+    setup_logging()
+    logging.info("Application starting (force_capture=%s, startup=%s)", args.force, args.startup)
     mutex = acquire_single_instance()
     if mutex is None:
         return 0
     try:
-        if not args.force and today_has_photo():
-            return 0
-        DailyPhotoApp(load_config()).run()
+        DailyPhotoApp(load_config(), force_capture=args.force).run()
         return 0
+    except Exception:
+        logging.exception("Unhandled application error")
+        try:
+            messagebox.showerror(APP_NAME, f"程序遇到错误，详情已写入：\n{LOG_PATH}")
+        except tk.TclError:
+            pass
+        return 1
     finally:
         ctypes.windll.kernel32.CloseHandle(mutex)
 

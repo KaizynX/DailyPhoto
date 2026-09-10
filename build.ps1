@@ -23,9 +23,11 @@ $dist = Join-Path $root "app"
 $work = Join-Path $root ".build"
 
 if (-not (Test-Path -LiteralPath (Join-Path $packages "cv2")) -or
-    -not (Test-Path -LiteralPath (Join-Path $packages "PyInstaller"))) {
+    -not (Test-Path -LiteralPath (Join-Path $packages "PyInstaller")) -or
+    -not (Test-Path -LiteralPath (Join-Path $packages "pystray"))) {
     & $python @pythonArguments -m pip install --disable-pip-version-check --target $packages `
-        "opencv-python-headless==4.12.0.88" "pyinstaller==6.15.0"
+        "opencv-python-headless==4.12.0.88" "pillow==11.3.0" `
+        "pystray==0.19.5" "pyinstaller==6.15.0"
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to install build dependencies."
     }

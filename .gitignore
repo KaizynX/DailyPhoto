@@ -1,6 +1,7 @@
 # Local build output and bundled dependencies.
 .build/
 .build-packages/
+.build-python/
 app/
 *.spec
 
