@@ -475,7 +475,7 @@ class DailyPhotoApp:
         crop_options.grid(row=0, column=1, sticky="w", padx=(14, 0), pady=5)
         ttk.Radiobutton(
             crop_options,
-            text="较大范围（16:9，推荐）",
+            text="完整头部与环境（16:9，推荐）",
             variable=crop,
             value="wide",
         ).pack(anchor="w")

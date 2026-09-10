@@ -102,10 +102,10 @@ def alignment_matrix(face: np.ndarray, output_size: tuple[int, int], crop: str) 
     else:
         target = np.array(
             [
-                [0.40 * width, 0.34 * height],
-                [0.60 * width, 0.34 * height],
-                [0.445 * width, 0.61 * height],
-                [0.555 * width, 0.61 * height],
+                [0.425 * width, 0.40 * height],
+                [0.575 * width, 0.40 * height],
+                [0.458 * width, 0.67 * height],
+                [0.542 * width, 0.67 * height],
             ],
             dtype=np.float32,
         )
