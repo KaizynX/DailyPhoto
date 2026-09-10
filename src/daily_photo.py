@@ -9,6 +9,7 @@ import os
 import queue
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,8 @@ import winreg
 import cv2
 from PIL import Image, ImageDraw, ImageTk
 import pystray
+
+import create_timelapse
 
 
 APP_NAME = "DailyPhoto"
@@ -370,13 +373,18 @@ class DailyPhotoApp:
         self.root.iconphoto(True, self.tk_icon)
         self.capture_window: CaptureWindow | None = None
         self.settings_window: tk.Toplevel | None = None
-        self.actions: queue.Queue[str] = queue.Queue()
+        self.timelapse_window: tk.Toplevel | None = None
+        self.timelapse_status: ttk.Label | None = None
+        self.timelapse_button: ttk.Button | None = None
+        self.timelapse_running = False
+        self.actions: queue.Queue = queue.Queue()
         self.tray = pystray.Icon(
             APP_NAME,
             self.icon_image,
             "DailyPhoto · 每日照片",
             menu=pystray.Menu(
                 pystray.MenuItem("立即拍照", self.enqueue_capture, default=True),
+                pystray.MenuItem("生成延时影像…", self.enqueue_timelapse),
                 pystray.MenuItem("参数设置…", self.enqueue_settings),
                 pystray.MenuItem("打开照片目录", self.enqueue_open_folder),
                 pystray.Menu.SEPARATOR,
@@ -396,6 +404,9 @@ class DailyPhotoApp:
     def enqueue_settings(self, icon=None, item=None) -> None:
         self.actions.put("settings")
 
+    def enqueue_timelapse(self, icon=None, item=None) -> None:
+        self.actions.put("timelapse")
+
     def enqueue_open_folder(self, icon=None, item=None) -> None:
         self.actions.put("folder")
 
@@ -408,9 +419,16 @@ class DailyPhotoApp:
     def process_actions(self) -> None:
         try:
             while True:
-                action = self.actions.get_nowait()
+                queued = self.actions.get_nowait()
+                action, payload = queued if isinstance(queued, tuple) else (queued, None)
                 if action == "capture":
                     self.open_capture()
+                elif action == "timelapse":
+                    self.open_timelapse()
+                elif action == "timelapse_progress":
+                    self.update_timelapse_progress(payload)
+                elif action == "timelapse_done":
+                    self.finish_timelapse(payload)
                 elif action == "settings":
                     self.open_settings()
                 elif action == "folder":
@@ -431,6 +449,161 @@ class DailyPhotoApp:
             self.capture_window.window.lift()
             return
         self.capture_window = CaptureWindow(self)
+
+    def open_timelapse(self) -> None:
+        if self.timelapse_window is not None and self.timelapse_window.winfo_exists():
+            self.timelapse_window.deiconify()
+            self.timelapse_window.lift()
+            return
+        window = tk.Toplevel(self.root)
+        self.timelapse_window = window
+        window.title("DailyPhoto · 生成延时影像")
+        window.resizable(False, False)
+        window.iconphoto(True, self.tk_icon)
+        window.protocol("WM_DELETE_WINDOW", self.close_timelapse)
+        frame = ttk.Frame(window, padding=18)
+        frame.grid(sticky="nsew")
+
+        crop = tk.StringVar(value="wide")
+        make_mp4 = tk.BooleanVar(value=True)
+        make_gif = tk.BooleanVar(value=False)
+        timestamp = tk.BooleanVar(value=True)
+        duration = tk.StringVar(value="250")
+
+        ttk.Label(frame, text="构图范围").grid(row=0, column=0, sticky="nw", pady=5)
+        crop_options = ttk.Frame(frame)
+        crop_options.grid(row=0, column=1, sticky="w", padx=(14, 0), pady=5)
+        ttk.Radiobutton(
+            crop_options,
+            text="较大范围（16:9，推荐）",
+            variable=crop,
+            value="wide",
+        ).pack(anchor="w")
+        ttk.Radiobutton(
+            crop_options, text="人脸特写（正方形）", variable=crop, value="face"
+        ).pack(anchor="w", pady=(4, 0))
+
+        ttk.Label(frame, text="输出格式").grid(row=1, column=0, sticky="nw", pady=5)
+        format_options = ttk.Frame(frame)
+        format_options.grid(row=1, column=1, sticky="w", padx=(14, 0), pady=5)
+        ttk.Checkbutton(format_options, text="MP4", variable=make_mp4).pack(side="left")
+        ttk.Checkbutton(format_options, text="GIF", variable=make_gif).pack(
+            side="left", padx=(14, 0)
+        )
+
+        ttk.Label(frame, text="每帧时长").grid(row=2, column=0, sticky="w", pady=5)
+        duration_row = ttk.Frame(frame)
+        duration_row.grid(row=2, column=1, sticky="w", padx=(14, 0), pady=5)
+        ttk.Entry(duration_row, textvariable=duration, width=8).pack(side="left")
+        ttk.Label(duration_row, text="毫秒").pack(side="left", padx=(6, 0))
+        ttk.Checkbutton(frame, text="在每帧左下角显示拍摄日期", variable=timestamp).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(8, 5)
+        )
+
+        self.timelapse_status = ttk.Label(frame, text="输出到 generated 目录")
+        self.timelapse_status.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 12))
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=5, column=0, columnspan=2, sticky="e")
+        ttk.Button(buttons, text="关闭", command=self.close_timelapse).pack(side="right")
+
+        def start() -> None:
+            if not make_mp4.get() and not make_gif.get():
+                messagebox.showerror(APP_NAME, "请至少选择一种输出格式。", parent=window)
+                return
+            try:
+                duration_ms = int(duration.get())
+                if not 20 <= duration_ms <= 60_000:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror(APP_NAME, "每帧时长必须是 20–60000 毫秒。", parent=window)
+                return
+            output_format = "both" if make_mp4.get() and make_gif.get() else (
+                "mp4" if make_mp4.get() else "gif"
+            )
+            crop_mode = crop.get()
+            arguments = argparse.Namespace(
+                input=photos_root(self.config),
+                output=ROOT / "generated",
+                format=output_format,
+                gif_name="daily-photo.gif",
+                video_name="daily-photo.mp4",
+                crop=crop_mode,
+                size=800 if crop_mode == "wide" else 600,
+                duration=duration_ms,
+                quality=92,
+                confidence=0.75,
+                background_blur=0,
+                timestamp="date" if timestamp.get() else "none",
+                strict=False,
+                include_all=False,
+                model=create_timelapse.resource_path(
+                    Path("models") / create_timelapse.DEFAULT_MODEL_NAME
+                ),
+            )
+            self.timelapse_running = True
+            self.timelapse_button.configure(state="disabled")
+            self.timelapse_status.configure(text="正在读取照片…")
+            threading.Thread(
+                target=self.generate_timelapse, args=(arguments,), daemon=True
+            ).start()
+
+        self.timelapse_button = ttk.Button(buttons, text="开始生成", command=start)
+        self.timelapse_button.pack(side="right", padx=(0, 8))
+        window.update_idletasks()
+        x = max(0, (window.winfo_screenwidth() - window.winfo_reqwidth()) // 2)
+        y = max(0, (window.winfo_screenheight() - window.winfo_reqheight()) // 2)
+        window.geometry(f"+{x}+{y}")
+        window.lift()
+
+    def generate_timelapse(self, arguments: argparse.Namespace) -> None:
+        def progress(current: int, total: int, relative: Path) -> None:
+            self.actions.put(("timelapse_progress", (current, total, str(relative))))
+
+        try:
+            paths, results = create_timelapse.create_timelapse(arguments, progress=progress)
+            skipped = sum(result.status != "aligned" for result in results)
+            self.actions.put(("timelapse_done", (paths, len(results) - skipped, skipped, None)))
+        except Exception as exc:
+            logging.exception("Timelapse generation failed")
+            self.actions.put(("timelapse_done", ([], 0, 0, str(exc))))
+
+    def update_timelapse_progress(self, payload) -> None:
+        if self.timelapse_status is None:
+            return
+        current, total, relative = payload
+        self.timelapse_status.configure(text=f"正在对齐 {current}/{total}：{relative}")
+
+    def finish_timelapse(self, payload) -> None:
+        paths, aligned, skipped, error = payload
+        self.timelapse_running = False
+        if self.timelapse_button is not None:
+            self.timelapse_button.configure(state="normal")
+        parent = self.timelapse_window if self.timelapse_window is not None else self.root
+        if error:
+            if self.timelapse_status is not None:
+                self.timelapse_status.configure(text="生成失败")
+            messagebox.showerror(APP_NAME, f"生成延时影像失败：\n{error}", parent=parent)
+            return
+        if self.timelapse_status is not None:
+            self.timelapse_status.configure(text=f"生成完成：成功 {aligned} 张，跳过 {skipped} 张")
+        names = "、".join(path.name for path in paths)
+        open_folder = messagebox.askyesno(
+            APP_NAME,
+            f"已生成 {names}\n成功 {aligned} 张，跳过 {skipped} 张。\n\n是否打开输出目录？",
+            parent=parent,
+        )
+        if open_folder:
+            os.startfile(ROOT / "generated")
+
+    def close_timelapse(self) -> None:
+        if self.timelapse_running:
+            messagebox.showinfo(APP_NAME, "正在生成，请完成后再关闭此窗口。", parent=self.timelapse_window)
+            return
+        if self.timelapse_window is not None and self.timelapse_window.winfo_exists():
+            self.timelapse_window.destroy()
+        self.timelapse_window = None
+        self.timelapse_status = None
+        self.timelapse_button = None
 
     def open_settings(self) -> None:
         if self.settings_window is not None and self.settings_window.winfo_exists():

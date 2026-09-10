@@ -43,6 +43,62 @@ photos\YYYY\MM\YYYY-MM-DD_HH-mm-ss.jpg
 - `install.ps1`：启用登录自启动；
 - `uninstall.ps1`：关闭登录自启动，不会删除程序、设置或照片。
 
+## 生成人脸对齐延时影像
+
+右键通知区域的 DailyPhoto 图标，选择“生成延时影像…”。生成窗口提供：
+
+- `较大范围（16:9）`：保留肩部、座椅和更多原图环境，默认选项；
+- `人脸特写（正方形）`：接近原先仅显示头部的紧凑画面；
+- MP4 和 GIF 独立复选框，可以只生成一种或同时生成；
+- 每帧时长；
+- 是否在左下角显示照片的拍摄日期。
+
+点击“开始生成”后会在后台处理；窗口会显示当前进度，完成后可以直接打开输出目录。
+
+也可以在项目目录中运行命令行工作流：
+
+```powershell
+.\create-timelapse.ps1
+```
+
+默认读取 `config.json` 指定的照片目录，按文件名顺序处理 DailyPhoto 标准命名的照片，生成带日期的 800×450 宽景 MP4，并输出：
+
+```text
+generated\
+  daily-photo.mp4
+  aligned\YYYY\MM\*.jpg
+  manifest.json
+```
+
+原始照片不会被裁剪、覆盖或移动。`manifest.json` 会列出每张照片是否成功；没有检测到人脸的照片默认跳过。
+
+常用选项：
+
+```powershell
+# 同时生成 MP4 和 GIF
+.\create-timelapse.ps1 --format both
+
+# 只生成 GIF
+.\create-timelapse.ps1 --format gif
+
+# 生成人脸特写且不显示日期
+.\create-timelapse.ps1 --crop face --timestamp none
+
+# 显示完整拍摄日期和时间
+.\create-timelapse.ps1 --timestamp datetime
+
+# 每帧停留 500 毫秒，输出宽度 960 像素
+.\create-timelapse.ps1 --duration 500 --size 960
+
+# 包含名称不符合 DailyPhoto 规则的导入图片
+.\create-timelapse.ps1 --include-all
+
+# 任何一张检测失败都停止生成
+.\create-timelapse.ps1 --strict
+```
+
+`--format` 可取 `mp4`、`gif` 或 `both`；`--crop` 可取 `wide` 或 `face`；`--timestamp` 可取 `date`、`datetime` 或 `none`。MP4 通常体积更小、颜色更好；GIF 便于直接嵌入聊天和网页。重复运行会更新 `generated` 中的派生文件，但不会影响原图。
+
 ## 常见问题
 
 ### 找不到托盘图标
@@ -73,4 +129,4 @@ photos\YYYY\MM\YYYY-MM-DD_HH-mm-ss.jpg
 app\DailyPhoto.exe --force
 ```
 
-开发环境中使用 PowerShell 7 运行 `build.ps1` 可重新生成 `app\DailyPhoto.exe`。
+开发环境中使用 PowerShell 7 运行 `build.ps1` 可重新生成 `app\DailyPhoto.exe` 和 `app\DailyPhotoTimelapse.exe`。
