@@ -26,4 +26,6 @@ DailyPhoto 是一个常驻 Windows 通知区域的每日拍照工具。所有照
 - 取消开机自启动：运行 `uninstall.ps1` 或在托盘菜单中关闭。
 - 强制打开拍照窗口进行测试：运行 `app\DailyPhoto.exe --force`。
 
+详细操作、设置说明和故障排查见 [操作手册](docs/USER_GUIDE.md)。
+
 完整设计和调研记录见 [PLAN.md](PLAN.md)。
