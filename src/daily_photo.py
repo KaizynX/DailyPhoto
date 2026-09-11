@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+from ctypes import wintypes
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -48,6 +49,180 @@ class MonitorInfo(ctypes.Structure):
 
 
 MONITOR_DEFAULTTONEAREST = 2
+WM_CLOSE = 0x0010
+WM_DESTROY = 0x0002
+WM_WTSSESSION_CHANGE = 0x02B1
+WTS_SESSION_UNLOCK = 0x8
+NOTIFY_FOR_THIS_SESSION = 0
+
+
+WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long,
+    wintypes.HWND,
+    wintypes.UINT,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+)
+
+
+class WindowClass(ctypes.Structure):
+    _fields_ = [
+        ("style", wintypes.UINT),
+        ("lpfnWndProc", WNDPROC),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", wintypes.HINSTANCE),
+        ("hIcon", wintypes.HICON),
+        ("hCursor", wintypes.HANDLE),
+        ("hbrBackground", wintypes.HBRUSH),
+        ("lpszMenuName", wintypes.LPCWSTR),
+        ("lpszClassName", wintypes.LPCWSTR),
+    ]
+
+
+class SessionUnlockMonitor:
+    """Receive Windows session-unlock notifications on a hidden window thread."""
+
+    def __init__(self, on_unlock) -> None:
+        self.on_unlock = on_unlock
+        self.hwnd = None
+        self.ready = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run, name="DailyPhotoSessionMonitor", daemon=True
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+        if not self.ready.wait(timeout=5):
+            logging.error("Session unlock monitor did not start in time")
+
+    def stop(self) -> None:
+        if self.hwnd:
+            ctypes.windll.user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
+        if self.thread.is_alive():
+            self.thread.join(timeout=2)
+
+    def _run(self) -> None:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        wtsapi32 = ctypes.windll.wtsapi32
+        class_name = f"DailyPhotoSessionMonitor_{os.getpid()}"
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+        hinstance = kernel32.GetModuleHandleW(None)
+
+        pointer_result = (
+            ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+        )
+        user32.DefWindowProcW.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        user32.DefWindowProcW.restype = pointer_result
+        user32.RegisterClassW.argtypes = [ctypes.POINTER(WindowClass)]
+        user32.RegisterClassW.restype = wintypes.ATOM
+        user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+        user32.UnregisterClassW.restype = wintypes.BOOL
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.HWND,
+            wintypes.HMENU,
+            wintypes.HINSTANCE,
+            wintypes.LPVOID,
+        ]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.DestroyWindow.argtypes = [wintypes.HWND]
+        user32.DestroyWindow.restype = wintypes.BOOL
+        user32.IsWindow.argtypes = [wintypes.HWND]
+        user32.IsWindow.restype = wintypes.BOOL
+        user32.PostMessageW.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        wtsapi32.WTSRegisterSessionNotification.argtypes = [
+            wintypes.HWND,
+            wintypes.DWORD,
+        ]
+        wtsapi32.WTSRegisterSessionNotification.restype = wintypes.BOOL
+        wtsapi32.WTSUnRegisterSessionNotification.argtypes = [wintypes.HWND]
+        wtsapi32.WTSUnRegisterSessionNotification.restype = wintypes.BOOL
+
+        @WNDPROC
+        def window_proc(hwnd, message, wparam, lparam):
+            if message == WM_WTSSESSION_CHANGE and wparam == WTS_SESSION_UNLOCK:
+                logging.info("Windows session unlocked")
+                self.on_unlock()
+                return 0
+            if message == WM_CLOSE:
+                user32.DestroyWindow(hwnd)
+                return 0
+            if message == WM_DESTROY:
+                user32.PostQuitMessage(0)
+                return 0
+            return user32.DefWindowProcW(hwnd, message, wparam, lparam)
+
+        window_class = WindowClass()
+        window_class.lpfnWndProc = window_proc
+        window_class.hInstance = hinstance
+        window_class.lpszClassName = class_name
+        atom = user32.RegisterClassW(ctypes.byref(window_class))
+        if not atom:
+            logging.error(
+                "Unable to register session monitor window (error=%s)",
+                kernel32.GetLastError(),
+            )
+            self.ready.set()
+            return
+
+        registered = False
+        try:
+            self.hwnd = user32.CreateWindowExW(
+                0, class_name, class_name, 0, 0, 0, 0, 0, None, None, hinstance, None
+            )
+            if not self.hwnd:
+                logging.error(
+                    "Unable to create session monitor window (error=%s)",
+                    kernel32.GetLastError(),
+                )
+                return
+            registered = bool(
+                wtsapi32.WTSRegisterSessionNotification(
+                    self.hwnd, NOTIFY_FOR_THIS_SESSION
+                )
+            )
+            if not registered:
+                logging.error(
+                    "Unable to register for session notifications (error=%s)",
+                    kernel32.GetLastError(),
+                )
+                return
+            logging.info("Session unlock monitor started")
+            self.ready.set()
+            message = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(message))
+                user32.DispatchMessageW(ctypes.byref(message))
+        except Exception:
+            logging.exception("Session unlock monitor failed")
+        finally:
+            self.ready.set()
+            if registered and self.hwnd:
+                wtsapi32.WTSUnRegisterSessionNotification(self.hwnd)
+            if self.hwnd and user32.IsWindow(self.hwnd):
+                user32.DestroyWindow(self.hwnd)
+            self.hwnd = None
+            user32.UnregisterClassW(class_name, hinstance)
 
 
 def app_root() -> Path:
@@ -394,12 +569,17 @@ class DailyPhotoApp:
             ),
         )
         self.tray.run_detached()
+        self.session_monitor = SessionUnlockMonitor(self.enqueue_unlock)
+        self.session_monitor.start()
         self.root.after(100, self.process_actions)
         if force_capture or not today_has_photo(self.config):
             self.root.after(250, self.open_capture)
 
     def enqueue_capture(self, icon=None, item=None) -> None:
         self.actions.put("capture")
+
+    def enqueue_unlock(self) -> None:
+        self.actions.put("unlock")
 
     def enqueue_settings(self, icon=None, item=None) -> None:
         self.actions.put("settings")
@@ -423,6 +603,8 @@ class DailyPhotoApp:
                 action, payload = queued if isinstance(queued, tuple) else (queued, None)
                 if action == "capture":
                     self.open_capture()
+                elif action == "unlock":
+                    self.handle_session_unlock()
                 elif action == "timelapse":
                     self.open_timelapse()
                 elif action == "timelapse_progress":
@@ -441,6 +623,13 @@ class DailyPhotoApp:
         except queue.Empty:
             pass
         self.root.after(100, self.process_actions)
+
+    def handle_session_unlock(self) -> None:
+        if today_has_photo(self.config):
+            logging.info("Unlock capture skipped because today's photo already exists")
+            return
+        logging.info("Unlock triggered today's capture")
+        self.open_capture()
 
     def open_capture(self) -> None:
         logging.info("Opening capture window")
@@ -703,6 +892,7 @@ class DailyPhotoApp:
         if self.capture_window is not None:
             self.capture_window.close()
         self.close_settings()
+        self.session_monitor.stop()
         self.tray.stop()
         self.root.destroy()
 
