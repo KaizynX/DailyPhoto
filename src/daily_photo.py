@@ -28,12 +28,13 @@ import create_timelapse
 APP_NAME = "DailyPhoto"
 MUTEX_NAME = "Local\\DailyPhotoCaptureMutex"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-LEGACY_TASK_NAME = "DailyPhoto"
+AUTOSTART_TASK_NAME = "DailyPhoto"
 MAX_PREVIEW_WIDTH = 800
 MAX_PREVIEW_HEIGHT = 450
 PREVIEW_ASPECT_RATIO = MAX_PREVIEW_WIDTH / MAX_PREVIEW_HEIGHT
 WINDOW_HORIZONTAL_RESERVE = 48
 WINDOW_VERTICAL_RESERVE = 170
+WINDOW_TOP_POSITION_RATIO = 0.12
 
 
 class Rect(ctypes.Structure):
@@ -281,6 +282,21 @@ def today_has_photo(config: dict, now: datetime | None = None) -> bool:
     return any(folder.glob(f"{now:%Y-%m-%d}_*.jpg")) if folder.exists() else False
 
 
+def upper_center_position(
+    left: int,
+    top: int,
+    available_width: int,
+    available_height: int,
+    window_width: int,
+    window_height: int,
+) -> tuple[int, int]:
+    x = left + max(0, (available_width - window_width) // 2)
+    available_below = max(0, available_height - window_height)
+    preferred_y = round(available_height * WINDOW_TOP_POSITION_RATIO)
+    y = top + min(preferred_y, available_below)
+    return x, y
+
+
 def acquire_single_instance() -> object | None:
     kernel32 = ctypes.windll.kernel32
     handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
@@ -291,17 +307,9 @@ def acquire_single_instance() -> object | None:
     return handle
 
 
-def startup_command() -> str:
-    if getattr(sys, "frozen", False):
-        parts = [str(Path(sys.executable).resolve()), "--startup"]
-    else:
-        parts = [str(Path(sys.executable).resolve()), str(Path(__file__).resolve()), "--startup"]
-    return subprocess.list2cmdline(parts)
-
-
-def legacy_task_exists() -> bool:
+def recovery_task_exists() -> bool:
     result = subprocess.run(
-        ["schtasks.exe", "/Query", "/TN", LEGACY_TASK_NAME],
+        ["schtasks.exe", "/Query", "/TN", AUTOSTART_TASK_NAME],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         creationflags=subprocess.CREATE_NO_WINDOW,
@@ -310,37 +318,31 @@ def legacy_task_exists() -> bool:
     return result.returncode == 0
 
 
-def remove_legacy_task() -> None:
-    subprocess.run(
-        ["schtasks.exe", "/Delete", "/TN", LEGACY_TASK_NAME, "/F"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-        check=False,
-    )
-
-
 def is_autostart_enabled() -> bool:
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
             winreg.QueryValueEx(key, APP_NAME)
         return True
     except OSError:
-        return legacy_task_exists()
+        return recovery_task_exists()
 
 
 def set_autostart(enabled: bool) -> None:
-    if enabled:
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, startup_command())
-        remove_legacy_task()
-        return
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
-            winreg.DeleteValue(key, APP_NAME)
-    except FileNotFoundError:
-        pass
-    remove_legacy_task()
+    script = ROOT / ("install.ps1" if enabled else "uninstall.ps1")
+    if not script.exists():
+        raise OSError(f"找不到自启动配置脚本：{script}")
+    program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    powershell7 = program_files / "PowerShell" / "7" / "pwsh.exe"
+    shell = str(powershell7) if powershell7.exists() else "powershell.exe"
+    result = subprocess.run(
+        [shell, "-NoLogo", "-NoProfile", "-File", str(script)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise OSError(f"自启动配置脚本执行失败（退出代码 {result.returncode}）")
 
 
 def create_app_icon(size: int = 64) -> Image.Image:
@@ -415,9 +417,10 @@ class CaptureWindow:
         self.window.update_idletasks()
         width, height = self.window.winfo_reqwidth(), self.window.winfo_reqheight()
         left, top, available_width, available_height = self.get_work_area()
-        x = left + max(0, (available_width - width) // 2)
-        y = top + max(0, (available_height - height) // 2)
-        position = f"+{x}+{y}"
+        x, y = upper_center_position(
+            left, top, available_width, available_height, width, height
+        )
+        position = f"{x:+d}{y:+d}"
         self.window.geometry(position)
         self.window.deiconify()
         self.window.lift()

@@ -12,7 +12,43 @@ $command = '"{0}" --startup' -f $executable
 New-Item -Path $runKey -Force | Out-Null
 New-ItemProperty -Path $runKey -Name "DailyPhoto" -PropertyType String -Value $command -Force | Out-Null
 
-# Remove the scheduled-task registration used by older DailyPhoto versions.
-Unregister-ScheduledTask -TaskName "DailyPhoto" -Confirm:$false -ErrorAction SilentlyContinue
+# The tray process normally receives unlock notifications itself. This task is a
+# recovery path: if that process has exited, the next unlock starts it again.
+$service = New-Object -ComObject "Schedule.Service"
+$service.Connect()
+$folder = $service.GetFolder("\")
+$task = $service.NewTask(0)
+$task.RegistrationInfo.Description = "Recover DailyPhoto on session unlock"
+$task.Settings.Enabled = $true
+$task.Settings.StartWhenAvailable = $true
+$task.Settings.DisallowStartIfOnBatteries = $false
+$task.Settings.StopIfGoingOnBatteries = $false
+$task.Settings.AllowHardTerminate = $true
+$task.Settings.ExecutionTimeLimit = "PT0S"
+# TASK_INSTANCES_IGNORE_NEW = 2
+$task.Settings.MultipleInstances = 2
 
-Write-Host "DailyPhoto will now start when you sign in."
+$userId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$unlockTrigger = $task.Triggers.Create(11)
+$unlockTrigger.Id = "SessionUnlockRecovery"
+$unlockTrigger.UserId = $userId
+$unlockTrigger.StateChange = 8
+$unlockTrigger.Enabled = $true
+
+$action = $task.Actions.Create(0)
+$action.Path = $executable
+$action.Arguments = "--startup"
+$action.WorkingDirectory = $root
+
+# TASK_CREATE_OR_UPDATE = 6; TASK_LOGON_INTERACTIVE_TOKEN = 3
+$null = $folder.RegisterTaskDefinition(
+    "DailyPhoto",
+    $task,
+    6,
+    $null,
+    $null,
+    3,
+    $null
+)
+
+Write-Host "DailyPhoto will start at sign-in and recover automatically on unlock."
