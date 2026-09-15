@@ -29,6 +29,11 @@ $task.Settings.ExecutionTimeLimit = "PT0S"
 $task.Settings.MultipleInstances = 2
 
 $userId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$logonTrigger = $task.Triggers.Create(9)
+$logonTrigger.Id = "LogonRecovery"
+$logonTrigger.UserId = $userId
+$logonTrigger.Enabled = $true
+
 $unlockTrigger = $task.Triggers.Create(11)
 $unlockTrigger.Id = "SessionUnlockRecovery"
 $unlockTrigger.UserId = $userId

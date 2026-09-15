@@ -318,13 +318,26 @@ def recovery_task_exists() -> bool:
     return result.returncode == 0
 
 
-def is_autostart_enabled() -> bool:
+def run_entry_exists() -> bool:
+    expected = f'"{ROOT / "app" / "DailyPhoto.exe"}" --startup'
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-            winreg.QueryValueEx(key, APP_NAME)
-        return True
+            value, _ = winreg.QueryValueEx(key, APP_NAME)
+        return value == expected
     except OSError:
-        return recovery_task_exists()
+        return False
+
+
+def is_autostart_enabled() -> bool:
+    return run_entry_exists() or recovery_task_exists()
+
+
+def repair_autostart_if_needed() -> None:
+    if run_entry_exists() and recovery_task_exists():
+        return
+    logging.warning("Autostart configuration is incomplete; repairing it")
+    set_autostart(True)
+    logging.info("Autostart configuration repaired")
 
 
 def set_autostart(enabled: bool) -> None:
@@ -914,6 +927,11 @@ def main() -> int:
     if mutex is None:
         return 0
     try:
+        if args.startup:
+            try:
+                repair_autostart_if_needed()
+            except OSError:
+                logging.exception("Unable to repair autostart configuration")
         DailyPhotoApp(load_config(), force_capture=args.force).run()
         return 0
     except Exception:
