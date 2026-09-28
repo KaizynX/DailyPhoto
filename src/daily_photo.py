@@ -52,9 +52,12 @@ class MonitorInfo(ctypes.Structure):
 MONITOR_DEFAULTTONEAREST = 2
 WM_CLOSE = 0x0010
 WM_DESTROY = 0x0002
+WM_DISPLAYCHANGE = 0x007E
+WM_SETTINGCHANGE = 0x001A
 WM_WTSSESSION_CHANGE = 0x02B1
 WTS_SESSION_UNLOCK = 0x8
 NOTIFY_FOR_THIS_SESSION = 0
+SWP_KEEP_SIZE_AND_FOCUS = 0x0001 | 0x0004 | 0x0010
 
 
 WNDPROC = ctypes.WINFUNCTYPE(
@@ -84,8 +87,9 @@ class WindowClass(ctypes.Structure):
 class SessionUnlockMonitor:
     """Receive Windows session-unlock notifications on a hidden window thread."""
 
-    def __init__(self, on_unlock) -> None:
+    def __init__(self, on_unlock, on_display_change) -> None:
         self.on_unlock = on_unlock
+        self.on_display_change = on_display_change
         self.hwnd = None
         self.ready = threading.Event()
         self.thread = threading.Thread(
@@ -165,6 +169,8 @@ class SessionUnlockMonitor:
                 logging.info("Windows session unlocked")
                 self.on_unlock()
                 return 0
+            if message in (WM_DISPLAYCHANGE, WM_SETTINGCHANGE):
+                self.on_display_change()
             if message == WM_CLOSE:
                 user32.DestroyWindow(hwnd)
                 return 0
@@ -381,6 +387,7 @@ class CaptureWindow:
         self.window.resizable(False, False)
         self.window.protocol("WM_DELETE_WINDOW", self.on_close)
         self.window.iconphoto(True, app.tk_icon)
+        self.window.bind("<Map>", self.on_map, add="+")
 
         _, _, available_width, available_height = self.get_work_area()
         self.preview_width, self.preview_height = self.preview_size(available_width, available_height)
@@ -404,19 +411,41 @@ class CaptureWindow:
         self.window.after(100, self.open_camera)
         self.center_window()
 
-    def get_work_area(self) -> tuple[int, int, int, int]:
+    def get_work_area(self, use_window_monitor: bool = False) -> tuple[int, int, int, int]:
         try:
             user32 = ctypes.windll.user32
-            pointer = Point(self.window.winfo_pointerx(), self.window.winfo_pointery())
-            monitor = user32.MonitorFromPoint(pointer, MONITOR_DEFAULTTONEAREST)
+            user32.MonitorFromPoint.argtypes = [Point, wintypes.DWORD]
+            user32.MonitorFromPoint.restype = ctypes.c_void_p
+            user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+            user32.MonitorFromWindow.restype = ctypes.c_void_p
+            user32.GetCursorPos.argtypes = [ctypes.POINTER(Point)]
+            user32.GetCursorPos.restype = wintypes.BOOL
+            user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MonitorInfo)]
+            user32.GetMonitorInfoW.restype = wintypes.BOOL
+            pointer = Point()
+            if use_window_monitor and self.window.winfo_ismapped():
+                monitor = user32.MonitorFromWindow(self.outer_window_handle(), MONITOR_DEFAULTTONEAREST)
+            elif user32.GetCursorPos(ctypes.byref(pointer)):
+                monitor = user32.MonitorFromPoint(pointer, MONITOR_DEFAULTTONEAREST)
+            else:
+                monitor = None
             info = MonitorInfo()
             info.cbSize = ctypes.sizeof(MonitorInfo)
             if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
                 work = info.rcWork
-                return work.left, work.top, work.right - work.left, work.bottom - work.top
+                width, height = work.right - work.left, work.bottom - work.top
+                if width > 0 and height > 0:
+                    return work.left, work.top, width, height
         except (AttributeError, OSError, tk.TclError):
             pass
         return 0, 0, self.window.winfo_screenwidth(), self.window.winfo_screenheight()
+
+    def outer_window_handle(self) -> int:
+        user32 = ctypes.windll.user32
+        user32.GetParent.argtypes = [wintypes.HWND]
+        user32.GetParent.restype = wintypes.HWND
+        inner = self.window.winfo_id()
+        return user32.GetParent(inner) or inner
 
     @staticmethod
     def preview_size(available_width: int, available_height: int) -> tuple[int, int]:
@@ -427,19 +456,42 @@ class CaptureWindow:
         return max(1, width), height
 
     def center_window(self) -> None:
+        self.position_window()
+        self.window.deiconify()
+        self.window.lift()
+        self.window.attributes("-topmost", True)
+        self.window.after(1500, lambda: self.window.attributes("-topmost", False))
+
+    def on_map(self, event: tk.Event) -> None:
+        if event.widget is self.window:
+            self.window.after_idle(self.position_window)
+
+    def position_window(self, use_window_monitor: bool = False) -> None:
+        if not self.window.winfo_exists():
+            return
+        left, top, available_width, available_height = self.get_work_area(use_window_monitor)
+        preview_width, preview_height = self.preview_size(available_width, available_height)
+        if (preview_width, preview_height) != (self.preview_width, self.preview_height):
+            self.preview_width, self.preview_height = preview_width, preview_height
+            self.preview.configure(width=preview_width, height=preview_height)
+            self.preview.coords(self.preview_image, preview_width // 2, preview_height // 2)
         self.window.update_idletasks()
         width, height = self.window.winfo_reqwidth(), self.window.winfo_reqheight()
-        left, top, available_width, available_height = self.get_work_area()
         x, y = upper_center_position(
             left, top, available_width, available_height, width, height
         )
-        position = f"{x:+d}{y:+d}"
-        self.window.geometry(position)
-        self.window.deiconify()
-        self.window.lift()
-        self.window.after_idle(lambda: self.window.geometry(position))
-        self.window.attributes("-topmost", True)
-        self.window.after(1500, lambda: self.window.attributes("-topmost", False))
+        if self.window.winfo_ismapped():
+            user32 = ctypes.windll.user32
+            user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+            user32.SetWindowPos.restype = wintypes.BOOL
+            if not user32.SetWindowPos(self.outer_window_handle(), None, x, y, 0, 0, SWP_KEEP_SIZE_AND_FOCUS):
+                logging.warning("Unable to position capture window (error=%s)", ctypes.windll.kernel32.GetLastError())
+        else:
+            self.window.geometry(f"{x:+d}{y:+d}")
+        logging.info(
+            "Capture window positioned at (%s, %s); work area=(%s, %s, %s, %s), size=(%s, %s)",
+            x, y, left, top, available_width, available_height, width, height,
+        )
 
     def open_camera(self) -> None:
         index = int(self.config["camera_index"])
@@ -585,7 +637,7 @@ class DailyPhotoApp:
             ),
         )
         self.tray.run_detached()
-        self.session_monitor = SessionUnlockMonitor(self.enqueue_unlock)
+        self.session_monitor = SessionUnlockMonitor(self.enqueue_unlock, self.enqueue_display_change)
         self.session_monitor.start()
         self.root.after(100, self.process_actions)
         if force_capture or not today_has_photo(self.config):
@@ -596,6 +648,9 @@ class DailyPhotoApp:
 
     def enqueue_unlock(self) -> None:
         self.actions.put("unlock")
+
+    def enqueue_display_change(self) -> None:
+        self.actions.put("display_change")
 
     def enqueue_settings(self, icon=None, item=None) -> None:
         self.actions.put("settings")
@@ -621,6 +676,8 @@ class DailyPhotoApp:
                     self.open_capture()
                 elif action == "unlock":
                     self.handle_session_unlock()
+                elif action == "display_change" and self.capture_window is not None:
+                    self.capture_window.position_window(use_window_monitor=True)
                 elif action == "timelapse":
                     self.open_timelapse()
                 elif action == "timelapse_progress":
